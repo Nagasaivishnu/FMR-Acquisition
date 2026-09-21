@@ -235,3 +235,6 @@ legacy/*
 !legacy/*.yaml
 !legacy/*.md
 !legacy/calibrate_power_supply
+calibrations/
+# A data folder picked inside the checkout (e.g. data1/) -- still data.
+/data*/

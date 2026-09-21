@@ -74,11 +74,27 @@ sample. "Degauss + ramp down" walks a decaying alternating current to zero to
 clear remanence before you remove the sample. The red button aborts anything
 running and takes the magnet to zero.
 
-**Calibration** — sweep the current, log the gaussmeter, fit
-`field = slope x current + intercept`. Writes `calibration_<timestamp>.csv`,
-a plot, and `magnet_calibration.json`, which the Field tab then uses. The
-coefficients live in that file instead of being pasted into the source as a
-literal.
+**Calibration** — the field tab converts tesla to amps with the *active*
+calibration, `magnet_calibration.json` in the data folder. It is loaded
+automatically at every start, so once saved you keep using it until you
+decide otherwise.
+
+To change it, get a new result one of two ways:
+
+- **Run calibration** — sweeps the current, logs the gaussmeter and fits
+  `field = slope x current + intercept`.
+- **Load from file...** — a calibration `.json` (any earlier run in
+  `calibrations/`) or a `.csv` of current and field. The old
+  `calibrated_data_*.csv` files load too, including the ones whose header
+  swallowed the first data row.
+
+The new result is shown next to the active one, plotted against it, with the
+difference (slope %, and mT at 10 A). Nothing changes until you click
+**Save as active**; **Discard** keeps what you had. Replacing the active file
+copies the old one into `calibrations/` first, and every run is archived
+there (`.csv` + `.json` + `.png`) whether you save it or not — so any earlier
+calibration can always be loaded back. Quitting with an unsaved result asks
+what to do.
 
 **Instruments** — every VISA address in one place, plus Connect/Disconnect and
 the `*IDN?` responses.

@@ -16,10 +16,12 @@ from matplotlib.figure import Figure
 from .acquisition import SweepWorker, field_setpoints, frequency_list
 from .fieldtools import (
     CALIBRATION_FILE,
+    HISTORY_DIR,
     Calibration,
     CalibrationWorker,
     RampDownWorker,
     SetFieldWorker,
+    save_as_active,
 )
 from .instruments import make_rig
 from .paths import save_data_dir
@@ -50,6 +52,7 @@ class FMRApp(tk.Tk):
 
         self.settings = Settings()
         self.calibration = Calibration.load(self.base_dir / CALIBRATION_FILE)
+        self.cal_candidate = None   # a run or loaded file awaiting Save/Discard
         self.rig = None
         self.worker = None
         self.events: "queue.Queue" = queue.Queue()
@@ -60,10 +63,11 @@ class FMRApp(tk.Tk):
         self._build_layout()
         self._load_settings_into_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._drain_events)
+        self._pump_id = self.after(100, self._drain_events)
         self.log(f"Data folder: {self.base_dir}  ({self.data_source})")
         if self.data_source == "default":
             self.log("Tip: Sweep tab -> 'Change...' to point at your FMR data folder.")
+        self._log_active_calibration()
 
     # ------------------------------------------------------------ appearance
 
@@ -395,8 +399,9 @@ class FMRApp(tk.Tk):
         note = ttk.Labelframe(t, text="Notes", padding=12)
         note.pack(fill="both", expand=True)
         ttk.Label(note, style="Hint.TLabel", justify="left", text=(
-            "• 'Go to field' converts tesla to amps with the saved calibration and\n"
-            "  leaves the magnet energised so you can mount or measure a sample.\n"
+            "• 'Go to field' converts tesla to amps with the ACTIVE calibration\n"
+            "  (Calibration tab) and leaves the magnet energised so you can\n"
+            "  mount or measure a sample.\n"
             "• 'Degauss + ramp down' walks a decaying alternating current to zero,\n"
             "  which clears remanence before you remove the sample.\n"
             "• 'STOP / magnet off' aborts whatever is running and ramps to zero.\n"
@@ -408,45 +413,116 @@ class FMRApp(tk.Tk):
 
     def _build_cal_tab(self) -> None:
         t = self.tab_cal
-        left = ttk.Frame(t)
-        left.pack(side="left", fill="y", padx=(0, 14))
+        column = ttk.Frame(t)
+        column.pack(side="left", fill="y", padx=(0, 14))
+        # Save / Discard are pinned below the scroll area so the decision is
+        # always on screen, whatever the window height.
+        footer = ttk.Frame(column, padding=(0, 8, 0, 0))
+        footer.pack(side="bottom", fill="x")
+        holder, left = self._scroll_column(column, width=352)
+        holder.pack(side="top", fill="both", expand=True)
         right = ttk.Frame(t)
         right.pack(side="left", fill="both", expand=True)
 
-        box = ttk.Labelframe(left, text="Calibration sweep", padding=12)
-        box.pack(fill="x")
+        # ---- 1. what is in use now
+        cur = ttk.Labelframe(left, text="Active calibration  (used by the Field tab)",
+                             padding=10)
+        cur.pack(fill="x")
+        self.v_cal_detail = tk.StringVar()
+        ttk.Label(cur, textvariable=self.v_cal_detail, font=MONO, background=BG,
+                  justify="left").pack(anchor="w")
+        self.v_cal_status = tk.StringVar()
+        ttk.Label(cur, textvariable=self.v_cal_status, style="Hint.TLabel",
+                  wraplength=300, justify="left").pack(anchor="w", pady=(6, 0))
+
+        # ---- 2. the candidate awaiting a decision
+        self.cand_box = ttk.Labelframe(left, text="New result  (not in use yet)",
+                                       padding=10)
+        self.cand_box.pack(fill="x", pady=(10, 0))
+        self.v_cand_detail = tk.StringVar()
+        ttk.Label(self.cand_box, textvariable=self.v_cand_detail, font=MONO,
+                  background=BG, justify="left", wraplength=320).pack(anchor="w")
+
+        # ---- 3. where a new one comes from
+        box = ttk.Labelframe(left, text="Get a new calibration", padding=10)
+        box.pack(fill="x", pady=(10, 0))
         self.v_cal_start = tk.StringVar(value="-10")
         self.v_cal_stop = tk.StringVar(value="10")
         self.v_cal_step = tk.StringVar(value="0.2")
         self.v_cal_settle = tk.StringVar(value="0.5")
-        self._row(box, 0, "Start (A)", self.v_cal_start)
-        self._row(box, 1, "Stop (A)", self.v_cal_stop)
-        self._row(box, 2, "Step (A)", self.v_cal_step)
-        self._row(box, 3, "Settle (s)", self.v_cal_settle)
-
-        btns = ttk.Frame(left, padding=(0, 12))
-        btns.pack(fill="x")
-        self.btn_cal = ttk.Button(btns, text="Run calibration", style="Accent.TButton",
-                                  command=self.on_calibrate)
+        self._row(box, 0, "Start (A)", self.v_cal_start, 10)
+        self._row(box, 1, "Stop (A)", self.v_cal_stop, 10)
+        self._row(box, 2, "Step (A)", self.v_cal_step, 10)
+        self._row(box, 3, "Settle (s)", self.v_cal_settle, 10)
+        btns = ttk.Frame(box, padding=(0, 8, 0, 0))
+        btns.grid(row=4, column=0, columnspan=3, sticky="w")
+        self.btn_cal = ttk.Button(btns, text="Run calibration", command=self.on_calibrate)
         self.btn_cal.pack(side="left")
-        ttk.Button(btns, text="Reload saved", command=self.on_reload_cal).pack(
-            side="left", padx=8)
+        ttk.Button(btns, text="Load from file...", command=self.on_load_cal).pack(
+            side="left", padx=6)
+        ttk.Label(box, style="Hint.TLabel", wraplength=300, justify="left", text=(
+            "Load accepts a calibration .json (from calibrations/) or a .csv of "
+            "current and field -- including the old calibrated_data_*.csv files. "
+            "Every run is archived in calibrations/ whether or not you save it."
+        )).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(box, text="Open calibrations folder",
+                   command=self.on_open_cal_folder).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        cur = ttk.Labelframe(left, text="Active calibration", padding=12)
-        cur.pack(fill="x")
-        self.v_cal_detail = tk.StringVar()
-        ttk.Label(cur, textvariable=self.v_cal_detail, style="Hint.TLabel",
-                  wraplength=260, justify="left").pack(anchor="w")
+        self.btn_cand_save = ttk.Button(footer, text="Save as active",
+                                        style="Accent.TButton", state="disabled",
+                                        command=self.on_save_candidate)
+        self.btn_cand_save.pack(side="left")
+        self.btn_cand_discard = ttk.Button(footer, text="Discard", state="disabled",
+                                           command=self.on_discard_candidate)
+        self.btn_cand_discard.pack(side="left", padx=6)
 
-        self.cal_fig = Figure(figsize=(6.0, 4.2), dpi=100)
+        # ---- plot
+        self.cal_fig = Figure(figsize=(5.8, 4.2), dpi=100)
         self.cal_ax = self.cal_fig.add_subplot(111)
-        self.cal_ax.set_xlabel("Applied current (A)")
-        self.cal_ax.set_ylabel("Measured field (T)")
-        self.cal_ax.grid(alpha=0.3)
         self.cal_canvas = FigureCanvasTkAgg(self.cal_fig, master=right)
         self.cal_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         self._refresh_calibration_labels()
+
+    def _draw_calibration_plot(self, live_points=None) -> None:
+        """Active calibration as a grey reference; candidate (or a live run)
+        on top, so the difference is visible before you commit to it."""
+        ax = self.cal_ax
+        ax.clear()
+        active, cand = self.calibration, self.cal_candidate
+
+        spans = [c.current_range_a for c in (active, cand)
+                 if c is not None and c.is_measured]
+        if live_points and live_points[0]:
+            spans.append((min(live_points[0]), max(live_points[0])))
+        lo = min((s_[0] for s_ in spans), default=-10.0)
+        hi = max((s_[1] for s_ in spans), default=10.0)
+        if lo == hi:
+            lo, hi = lo - 1, hi + 1
+        xs = np.linspace(lo, hi, 50)
+
+        label = "active" if active.is_measured else "active (default estimate)"
+        ax.plot(xs, active.field_for_current(xs), "--", color="#888", lw=1.5,
+                label=f"{label}: {active.slope:.5g} T/A")
+
+        if cand is not None:
+            if cand.currents and len(cand.currents) > 2:
+                step = max(1, len(cand.currents) // 400)
+                ax.plot(cand.currents[::step], cand.fields[::step], "o", ms=2.5,
+                        color=ACCENT, alpha=0.7, label="new: measured")
+            ax.plot(xs, cand.field_for_current(xs), "-", color=STOP_RED, lw=1.6,
+                    label=f"new fit: {cand.slope:.5g} T/A (R2={cand.r_squared:.5f})")
+        if live_points:
+            ax.plot(live_points[0], live_points[1], "o", ms=3, color=ACCENT,
+                    label="measuring...")
+
+        ax.set_xlabel("Applied current (A)")
+        ax.set_ylabel("Field (T)")
+        ax.set_title("Magnet calibration")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=8)
+        self.cal_canvas.draw_idle()
 
     # ------------------------------------------------------------- settings
 
@@ -529,16 +605,39 @@ class FMRApp(tk.Tk):
             self.v_plan.set("")
 
     def _refresh_calibration_labels(self) -> None:
-        self.v_cal_text.set(f"Calibration: {self.calibration.describe()}")
-        self.v_cal_detail.set(
-            f"slope      {self.calibration.slope:.6g} T/A\n"
-            f"intercept  {self.calibration.intercept:+.5g} T\n"
-            f"R-squared  {self.calibration.r_squared:.5f}\n"
-            f"points     {self.calibration.n_points}\n"
-            f"range      {self.calibration.current_range_a[0]:g} .. "
-            f"{self.calibration.current_range_a[1]:g} A\n"
-            f"created    {self.calibration.created or '(never)'}\n\n"
-            f"{self.calibration.note}")
+        c = self.calibration
+        self.v_cal_text.set(f"Calibration: {c.describe()}")
+        self.v_cal_detail.set(_cal_block(c))
+        active_file = self.base_dir / CALIBRATION_FILE
+        if c.is_measured:
+            self.v_cal_status.set(f"From {active_file.name} in the data folder; "
+                                  f"loaded automatically at every start.")
+        else:
+            self.v_cal_status.set(f"No {CALIBRATION_FILE} in the data folder -- using "
+                                  f"a rough default. Run or load a calibration, "
+                                  f"then 'Save as active'.")
+
+        cand = self.cal_candidate
+        if cand is None:
+            self.v_cand_detail.set("None. Run a calibration or load a file below;\n"
+                                   "the active one stays in use until you\n"
+                                   "click 'Save as active'.")
+            state = "disabled"
+        else:
+            self.v_cand_detail.set(_cal_block(cand) + "\n\n" + cand.compare(c))
+            state = "normal"
+        self.btn_cand_save.configure(state=state)
+        self.btn_cand_discard.configure(state=state)
+        self._draw_calibration_plot()
+
+    def _log_active_calibration(self) -> None:
+        c = self.calibration
+        if c.is_measured:
+            self.log(f"Calibration in use: {c.describe()}  "
+                     f"[{self.base_dir / CALIBRATION_FILE}]")
+        else:
+            self.log(f"WARNING: no {CALIBRATION_FILE} in the data folder -- field "
+                     f"targets use a default {c.slope:g} T/A estimate.")
 
     # ------------------------------------------------------------- commands
 
@@ -662,6 +761,14 @@ class FMRApp(tk.Tk):
         s = self._collect_settings()
         target = _to_float(self.v_target.get(), 0.0)
         as_field = self.v_target_unit.get() == "T"
+        if as_field and not self.calibration.is_measured and not messagebox.askyesno(
+                "No calibration",
+                "There is no saved calibration, so tesla is converted with a rough "
+                f"default ({self.calibration.slope:g} T/A).\n\nContinue anyway?"):
+            return
+        if as_field and self.cal_candidate is not None:
+            self.log("Note: using the ACTIVE calibration; the new result on the "
+                     "Calibration tab is not saved yet.")
         self._stop_monitor()
         self.worker = SetFieldWorker(self.rig, self.events, self.calibration,
                                      target, as_field,
@@ -689,12 +796,14 @@ class FMRApp(tk.Tk):
         if not self._require_rig():
             return
         s = self._collect_settings()
+        if self.cal_candidate is not None and not messagebox.askyesno(
+                "Unsaved result",
+                "There is a new calibration you have not saved. Discard it and "
+                "run another?"):
+            return
         self._stop_monitor()
-        self.cal_ax.clear()
-        self.cal_ax.set_xlabel("Applied current (A)")
-        self.cal_ax.set_ylabel("Measured field (T)")
-        self.cal_ax.grid(alpha=0.3)
-        self.cal_canvas.draw_idle()
+        self.cal_candidate = None
+        self._refresh_calibration_labels()
         self.worker = CalibrationWorker(
             self.rig, self.events, self.base_dir,
             _to_float(self.v_cal_start.get(), -10.0),
@@ -718,14 +827,77 @@ class FMRApp(tk.Tk):
         save_data_dir(self.base_dir)
         self.v_datadir.set(str(self.base_dir))
         self.calibration = Calibration.load(self.base_dir / CALIBRATION_FILE)
+        self.cal_candidate = None
         self._refresh_calibration_labels()
         self.log(f"Data folder set to {self.base_dir} (remembered on this machine).")
-        self.log(f"Calibration: {self.calibration.describe()}")
+        self._log_active_calibration()
 
-    def on_reload_cal(self) -> None:
-        self.calibration = Calibration.load(self.base_dir / CALIBRATION_FILE)
+    def on_load_cal(self) -> None:
+        start = self.base_dir / HISTORY_DIR
+        path = filedialog.askopenfilename(
+            initialdir=str(start if start.exists() else self.base_dir),
+            title="Load a calibration",
+            filetypes=[("Calibration", "*.json *.csv"), ("JSON", "*.json"),
+                       ("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            cand = Calibration.from_file(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Could not load calibration", str(exc))
+            self.log(f"Load failed for {Path(path).name}: {exc}")
+            return
+        if not cand.is_measured:
+            messagebox.showerror("Could not load calibration",
+                                 f"{Path(path).name} does not contain a fitted calibration.")
+            return
+        self.cal_candidate = cand
         self._refresh_calibration_labels()
-        self.log(f"Calibration reloaded: {self.calibration.describe()}")
+        self.log(f"Loaded {Path(path).name}: {cand.describe()} -- "
+                 f"review, then 'Save as active' to use it.")
+
+    def on_save_candidate(self) -> None:
+        cand = self.cal_candidate
+        if cand is None:
+            return
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showwarning("Busy", "Wait for the current operation to finish.")
+            return
+        old = self.calibration
+        if not messagebox.askyesno(
+                "Replace active calibration?",
+                f"Current:  {old.describe()}\n"
+                f"New:      {cand.describe()}\n\n"
+                f"{cand.compare(old)}\n\n"
+                f"The current file is kept in {HISTORY_DIR}/ and can be loaded back."):
+            return
+        try:
+            backup = save_as_active(cand, self.base_dir)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.calibration = Calibration.load(self.base_dir / CALIBRATION_FILE)
+        self.cal_candidate = None
+        self._refresh_calibration_labels()
+        self.log(f"Active calibration updated: {self.calibration.describe()}")
+        if backup is not None:
+            self.log(f"Previous calibration kept as {HISTORY_DIR}/{backup.name}")
+
+    def on_discard_candidate(self) -> None:
+        if self.cal_candidate is None:
+            return
+        self.cal_candidate = None
+        self._refresh_calibration_labels()
+        self.log("New calibration discarded; active calibration unchanged.")
+
+    def on_open_cal_folder(self) -> None:
+        folder = self.base_dir / HISTORY_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            import os
+            os.startfile(folder)  # type: ignore[attr-defined]  # Windows
+        except Exception:  # noqa: BLE001
+            self.log(f"Calibration history: {folder}")
 
     # ---------------------------------------------------------- field monitor
 
@@ -757,7 +929,7 @@ class FMRApp(tk.Tk):
                 self._handle(kind, payload)
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        self._pump_id = self.after(100, self._drain_events)
 
     def _handle(self, kind: str, payload) -> None:
         if kind == "log":
@@ -791,21 +963,17 @@ class FMRApp(tk.Tk):
                 self.var_field.set(f"field {fields[-1]:+.5f} T")
 
         elif kind == "cal_points":
-            currents, fields = payload
-            self.cal_ax.clear()
-            self.cal_ax.plot(currents, fields, "o", ms=3, color=ACCENT)
-            self.cal_ax.set_xlabel("Applied current (A)")
-            self.cal_ax.set_ylabel("Measured field (T)")
-            self.cal_ax.grid(alpha=0.3)
-            self.cal_canvas.draw_idle()
+            self._draw_calibration_plot(live_points=payload)
 
         elif kind == "cal_progress":
             i, n = payload
             self.v_prog_text.set(f"Calibrating {i}/{n}")
 
         elif kind == "cal_done":
-            self.calibration = payload
+            # A fresh run never replaces the active calibration on its own.
+            self.cal_candidate = payload
             self._refresh_calibration_labels()
+            self.nb.select(self.tab_cal)
 
         elif kind == "field_step":
             self.v_prog_text.set(f"Ramping: {payload:+.2f} A")
@@ -839,6 +1007,13 @@ class FMRApp(tk.Tk):
 
     # ---------------------------------------------------------------- close
 
+    def destroy(self) -> None:
+        try:
+            self.after_cancel(self._pump_id)
+        except Exception:  # noqa: BLE001
+            pass
+        super().destroy()
+
     def _on_close(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             if not messagebox.askyesno(
@@ -848,10 +1023,37 @@ class FMRApp(tk.Tk):
                 return
             self.worker.stop()
             self.worker.join(timeout=20)
+        if self.cal_candidate is not None:
+            answer = messagebox.askyesnocancel(
+                "Unsaved calibration",
+                f"New calibration not saved:\n{self.cal_candidate.describe()}\n\n"
+                f"Save it as the active calibration before quitting?\n"
+                f"(No keeps the current one.)")
+            if answer is None:
+                return
+            if answer:
+                save_as_active(self.cal_candidate, self.base_dir)
         self._stop_monitor()
         if self.rig is not None:
             self.rig.close()
         self.destroy()
+
+
+def _cal_block(c: Calibration) -> str:
+    if not c.is_measured:
+        return (f"slope      {c.slope:.6g} T/A\n"
+                f"intercept  {c.intercept:+.5g} T\n"
+                f"(default estimate -- not measured)")
+    src = Path(c.source).name if c.source else "-"
+    if len(src) > 26:
+        src = src[:12] + "..." + src[-11:]
+    return (f"slope      {c.slope:.6g} T/A\n"
+            f"intercept  {c.intercept:+.5g} T\n"
+            f"R-squared  {c.r_squared:.5f}\n"
+            f"points     {c.n_points}  ({c.current_range_a[0]:g} .. "
+            f"{c.current_range_a[1]:g} A)\n"
+            f"measured   {c.created.replace('T', ' ')}\n"
+            f"source     {src}")
 
 
 def _to_float(text: str, default: float) -> float:

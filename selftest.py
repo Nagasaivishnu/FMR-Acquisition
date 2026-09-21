@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fmrui.acquisition import SweepWorker, field_setpoints, frequency_list
-from fmrui.fieldtools import CalibrationWorker
+from fmrui.fieldtools import Calibration, CalibrationWorker, save_as_active
 from fmrui.instruments import make_rig
 from fmrui.settings import Settings
 
@@ -115,13 +115,62 @@ with tempfile.TemporaryDirectory() as tmp:
         check("fitted slope is close to the simulator's 0.0267 T/A",
               abs(cal.slope - 0.0267) < 5e-4, f"{cal.slope:.6g}")
         check("fit quality is sane", cal.r_squared > 0.999, f"R2={cal.r_squared:.6f}")
-        check("calibration file saved",
-              (base / "magnet_calibration.json").exists())
-    cal_csv = sorted(base.glob("calibration_*.csv"))
+        check("a fresh run does NOT replace the active calibration",
+              not (base / "magnet_calibration.json").exists())
+        check("run archived in calibrations/ (csv + json + png)",
+              all(len(list((base / "calibrations").glob(f"calibration_*.{e}"))) == 1
+                  for e in ("csv", "json", "png")))
+    cal_csv = sorted((base / "calibrations").glob("calibration_*.csv"))
     if cal_csv:
         first_line = cal_csv[0].read_text().splitlines()[0]
         check("calibration CSV header is its own line",
               first_line == "AppliedCurrent,MeasuredCurrent,field", first_line)
+        again = Calibration.from_csv(cal_csv[0])
+        check("re-fitting the archived CSV reproduces the run",
+              abs(again.slope - cal.slope) < 1e-12)
+
+    print("\nCalibration save / load")
+    first = Calibration.from_points([0, 1, 2, 3], [0.0, 0.025, 0.05, 0.075],
+                                    note="first")
+    backup = save_as_active(first, base)
+    active = base / "magnet_calibration.json"
+    check("save_as_active writes the active file", active.exists())
+    check("no backup when nothing was replaced", backup is None)
+    reloaded = Calibration.load(active)
+    check("active file reloads with its points",
+          abs(reloaded.slope - 0.025) < 1e-12 and len(reloaded.currents) == 4)
+
+    second = Calibration.from_points([0, 1, 2, 3], [0.0, 0.027, 0.054, 0.081])
+    backup = save_as_active(second, base)
+    check("replacing keeps the previous file in calibrations/",
+          backup is not None and backup.exists()
+          and abs(Calibration.load(backup).slope - 0.025) < 1e-12)
+    check("new calibration is now active",
+          abs(Calibration.load(active).slope - 0.027) < 1e-12)
+    check("comparison text reports the change",
+          "+8.00 %" in second.compare(first) and "+20.00 mT" in second.compare(first), second.compare(first))
+
+    old_json = base / "old_style.json"
+    old_json.write_text('{"slope": 0.0241, "intercept": -0.0006, "r_squared": 0.99,'
+                        ' "n_points": 10, "current_range_a": [5, 10],'
+                        ' "created": "2025-07-14T12:00:00", "note": "x"}')
+    old = Calibration.from_file(old_json)
+    check("older JSON without raw points still loads",
+          abs(old.slope - 0.0241) < 1e-12 and len(old.currents) == 2)
+
+    glued = base / "calibrated_data_legacy.csv"
+    glued.write_text("field,AppliedCurrent,MeasureCurrent-0.0013, 0, -0.0414\n"
+                     "0.0254, 1.0, 1.01\n0.0521, 2.0, 1.98\n0.0788, 3.0, 3.02\n")
+    leg = Calibration.from_file(glued)
+    check("legacy CSV with glued header: first row recovered",
+          leg.n_points == 4 and leg.currents[0] == 0.0 and leg.fields[0] == -0.0013,
+          f"{leg.n_points} pts, first ({leg.currents[0]}, {leg.fields[0]})")
+    check("legacy CSV columns mapped by name (field is col 0)",
+          abs(leg.slope - 0.02674) < 5e-4, f"{leg.slope:.5f}")
+
+    missing = Calibration.load(base / "nope.json")
+    check("missing active file falls back to the default estimate",
+          not missing.is_measured)
 
 print("\nSettings round-trip")
 with tempfile.TemporaryDirectory() as tmp:

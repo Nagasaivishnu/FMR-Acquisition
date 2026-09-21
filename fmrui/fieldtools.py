@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import queue
+import re
+import shutil
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -22,12 +24,17 @@ from matplotlib.figure import Figure
 
 from .instruments import Rig
 
-CALIBRATION_FILE = "magnet_calibration.json"
+CALIBRATION_FILE = "magnet_calibration.json"   # the active calibration
+HISTORY_DIR = "calibrations"                    # every run and replaced file
 
 
 @dataclass
 class Calibration:
-    """field_T = slope * current_A + intercept."""
+    """field_T = slope * current_A + intercept.
+
+    The raw points are kept with the fit so any saved calibration can be
+    re-plotted and compared later.
+    """
 
     slope: float = 0.0267
     intercept: float = 0.0
@@ -35,7 +42,16 @@ class Calibration:
     n_points: int = 0
     current_range_a: tuple = (0.0, 0.0)
     created: str = ""
-    note: str = "default estimate -- run a calibration to replace"
+    note: str = "default estimate -- run or load a calibration to replace"
+    source: str = ""
+    currents: list = field(default_factory=list)
+    fields: list = field(default_factory=list)
+
+    # ------------------------------------------------------------ conversion
+
+    @property
+    def is_measured(self) -> bool:
+        return bool(self.created)
 
     def current_for_field(self, field_t: float) -> float:
         if self.slope == 0:
@@ -45,26 +61,180 @@ class Calibration:
     def field_for_current(self, current_a: float) -> float:
         return self.slope * current_a + self.intercept
 
+    # ------------------------------------------------------------- building
+
+    @classmethod
+    def from_points(cls, currents, fields, source: str = "", created: str = "",
+                    note: str = "") -> "Calibration":
+        cur = np.asarray(currents, dtype=float)
+        fld = np.asarray(fields, dtype=float)
+        ok = np.isfinite(cur) & np.isfinite(fld)
+        cur, fld = cur[ok], fld[ok]
+        if len(cur) < 3 or np.ptp(cur) == 0:
+            raise ValueError("Need at least 3 points spanning more than one current.")
+        slope, intercept = np.polyfit(cur, fld, 1)
+        predicted = slope * cur + intercept
+        ss_res = float(np.sum((fld - predicted) ** 2))
+        ss_tot = float(np.sum((fld - fld.mean()) ** 2))
+        return cls(
+            slope=float(slope), intercept=float(intercept),
+            r_squared=1 - ss_res / ss_tot if ss_tot else 0.0,
+            n_points=int(len(cur)),
+            current_range_a=(float(cur.min()), float(cur.max())),
+            created=created or datetime.now().isoformat(timespec="seconds"),
+            note=note, source=source,
+            currents=[float(c) for c in cur], fields=[float(f) for f in fld],
+        )
+
+    @classmethod
+    def from_csv(cls, path: Path) -> "Calibration":
+        """Fit a calibration from a CSV of current and field.
+
+        Reads the new format (`AppliedCurrent,MeasuredCurrent,field`) and the
+        old `calibrated_data_*.csv` files, including the ones whose header has
+        no line ending and swallowed the first data row.
+        """
+        path = Path(path)
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            raise ValueError(f"{path.name} is empty.")
+        first, _, rest = text.partition("\n")
+
+        # Split "field,AppliedCurrent,MeasureCurrent-0.0013, 0, -0.04" into the
+        # header names and whatever numeric row got glued onto the end.
+        m = re.match(r"^\s*((?:[A-Za-z_][A-Za-z_ ]*,\s*)*[A-Za-z_][A-Za-z_]*)(.*)$", first)
+        if not m:
+            raise ValueError(f"{path.name}: no header row found.")
+        names = [n.strip().lower() for n in m.group(1).split(",")]
+        glued = m.group(2).strip().lstrip(",").strip()
+        lines = ([glued] if glued else []) + rest.splitlines()
+
+        def column(*candidates):
+            for c in candidates:
+                if c in names:
+                    return names.index(c)
+            return None
+
+        i_cur = column("appliedcurrent", "current", "measuredcurrent", "measurecurrent")
+        i_fld = column("field", "field_t", "b")
+        if i_cur is None or i_fld is None:
+            raise ValueError(f"{path.name}: need a current column and a field column, "
+                             f"found {names}.")
+
+        currents, fields = [], []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            try:
+                currents.append(float(parts[i_cur]))
+                fields.append(float(parts[i_fld]))
+            except (IndexError, ValueError):
+                continue  # blank or malformed row
+
+        return cls.from_points(currents, fields, source=str(path),
+                               created=_date_for(path), note=f"fitted from {path.name}")
+
+    @classmethod
+    def from_file(cls, path: Path) -> "Calibration":
+        """Load a calibration JSON, or fit one from a CSV."""
+        path = Path(path)
+        if path.suffix.lower() == ".csv":
+            return cls.from_csv(path)
+        cal = cls.load(path)
+        if not cal.source:
+            cal.source = str(path)
+        return cal
+
+    # ---------------------------------------------------------- persistence
+
     def save(self, path: Path) -> None:
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        data = asdict(self)
+        data["current_range_a"] = list(self.current_range_a)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(asdict(self), fh, indent=2)
+            json.dump(data, fh, indent=2)
 
     @classmethod
     def load(cls, path: Path) -> "Calibration":
+        """Read a calibration JSON. Missing file -> default estimate."""
         if not Path(path).exists():
             return cls()
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
+        known = {f.name for f in fields(cls)}
+        data = {k: v for k, v in data.items() if k in known}
         data["current_range_a"] = tuple(data.get("current_range_a", (0.0, 0.0)))
-        return cls(**data)
+        cal = cls(**data)
+        # Older files have no points; synthesise the fitted line so it plots.
+        if not cal.currents and cal.is_measured and cal.current_range_a[0] != cal.current_range_a[1]:
+            lo, hi = cal.current_range_a
+            cal.currents = [lo, hi]
+            cal.fields = [cal.field_for_current(lo), cal.field_for_current(hi)]
+        return cal
+
+    # ------------------------------------------------------------- display
 
     def describe(self) -> str:
-        if not self.created:
-            return f"{self.slope:.6g} T/A (default, not measured)"
+        if not self.is_measured:
+            return f"{self.slope:.6g} T/A (default estimate, not measured)"
         return (f"{self.slope:.6g} T/A, offset {self.intercept:+.4g} T "
                 f"| R2={self.r_squared:.5f} | {self.n_points} pts "
                 f"| {self.created[:10]}")
+
+    def compare(self, other: "Calibration", at_current_a: float = 10.0) -> str:
+        """How much would switching from `other` to `self` change the field?"""
+        if other.slope == 0:
+            return ""
+        d_slope = 100.0 * (self.slope - other.slope) / other.slope
+        d_field = (self.field_for_current(at_current_a)
+                   - other.field_for_current(at_current_a)) * 1e3
+        return (f"vs active  slope {d_slope:+.2f} %\n"
+                f"           {d_field:+.2f} mT at {at_current_a:g} A")
+
+
+def _date_for(path: Path) -> str:
+    """When was this calibration measured?
+
+    Old files carry the date in the name as DDMMYYYY
+    (calibrated_data_14072025_high_field.csv); new ones as YYYYMMDD_HHMMSS
+    (calibration_20260921_071820.csv). Copying a file resets its modification
+    time, so the name is more trustworthy -- mtime is only the fallback.
+    """
+    name = path.stem
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", name)
+    if m:
+        try:
+            return datetime(*map(int, m.groups())).isoformat(timespec="seconds")
+        except ValueError:
+            pass
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})(20\d{2})(?!\d)", name)
+    if m:
+        d, mo, y = map(int, m.groups())
+        try:
+            return datetime(y, mo, d).isoformat(timespec="seconds")
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+
+
+def save_as_active(candidate: Calibration, data_dir: Path) -> Path | None:
+    """Make `candidate` the calibration used from now on.
+
+    The file it replaces is copied into calibrations/ first, so nothing is lost
+    and any earlier calibration can be loaded back.
+    Returns the backup path, if one was made.
+    """
+    data_dir = Path(data_dir)
+    active = data_dir / CALIBRATION_FILE
+    backup = None
+    if active.exists():
+        history = data_dir / HISTORY_DIR
+        history.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = history / f"replaced_{stamp}_{CALIBRATION_FILE}"
+        shutil.copy2(active, backup)
+    candidate.save(active)
+    return backup
 
 
 class _BaseWorker(threading.Thread):
@@ -215,25 +385,12 @@ class CalibrationWorker(_BaseWorker):
             if len(applied) < 3:
                 raise RuntimeError("Not enough points to fit.")
 
-            slope, intercept = np.polyfit(applied, fields, 1)
-            predicted = np.polyval([slope, intercept], applied)
-            ss_res = float(np.sum((np.array(fields) - predicted) ** 2))
-            ss_tot = float(np.sum((np.array(fields) - np.mean(fields)) ** 2))
-            r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
-
             stamp = datetime.now()
-            calibration = Calibration(
-                slope=float(slope), intercept=float(intercept), r_squared=r2,
-                n_points=len(applied),
-                current_range_a=(float(applied[0]), float(applied[-1])),
-                created=stamp.isoformat(timespec="seconds"),
-                note="measured with CalibrationWorker",
-            )
-
-            self.out_dir.mkdir(parents=True, exist_ok=True)
             tag = stamp.strftime("%Y%m%d_%H%M%S")
+            history = self.out_dir / HISTORY_DIR
+            history.mkdir(parents=True, exist_ok=True)
 
-            csv_path = self.out_dir / f"calibration_{tag}.csv"
+            csv_path = history / f"calibration_{tag}.csv"
             # Header terminated with a newline -- the old writer omitted it and
             # glued the first data row onto the header.
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
@@ -241,12 +398,20 @@ class CalibrationWorker(_BaseWorker):
                 for a, m, f in zip(applied, measured, fields):
                     fh.write(f"{a},{m},{f}\n")
 
-            png_path = self.out_dir / f"calibration_{tag}.png"
-            _plot_calibration(png_path, applied, fields, slope, intercept, r2)
+            calibration = Calibration.from_points(
+                applied, fields, source=str(csv_path),
+                created=stamp.isoformat(timespec="seconds"),
+                note="measured on the Calibration tab")
 
-            calibration.save(self.out_dir / CALIBRATION_FILE)
-            self.log(f"Fit: {slope:.6g} T/A, intercept {intercept:+.4g} T, R2={r2:.5f}")
-            self.log(f"Saved {csv_path.name}, {png_path.name} and {CALIBRATION_FILE}")
+            png_path = history / f"calibration_{tag}.png"
+            _plot_calibration(png_path, applied, fields, calibration.slope,
+                              calibration.intercept, calibration.r_squared)
+            calibration.save(history / f"calibration_{tag}.json")
+
+            self.log(f"Fit: {calibration.slope:.6g} T/A, intercept "
+                     f"{calibration.intercept:+.4g} T, R2={calibration.r_squared:.5f}")
+            self.log(f"Saved to {HISTORY_DIR}/calibration_{tag}.* -- not active yet. "
+                     f"Click 'Save as active' to use it.")
             self.emit("cal_done", calibration)
 
         except Exception as exc:  # noqa: BLE001
