@@ -1,0 +1,53 @@
+FMR_INPUT:
+  output_folder: "background0db_reverse_sweep"
+  smaple_identity: "background0db_reverse_sweep_500uV"
+  microwave_frequencies:
+    start_frequency: 2E9
+    stop_frequency: 20E9
+    frequency_interval: 50E6
+  power_in_dbm: 0
+  gyromagnetic_ratio: 1.76e11
+
+  magnetic_filed_range:
+    range_min: 15
+    range_max: -15
+    filed_interval: 0.02
+
+  lock_in_amp:
+    phase: 0
+    time_contant: 300
+    # freq: 57
+    freq: 113.52
+    amp: 4
+    sens: 15
+    filter_slope: 24
+
+
+# i sensitivity i sensitivity
+# 0 2 nV/fA 
+# 1 5 nV/fA 
+# 2 10 nV/fA 
+# 3 20 nV/fA 
+# 4 50 nV/fA 
+# 5 100 nV/fA 
+# 6 200 nV/fA 
+# 7 500 nV/fA 
+# 8 1 µV/pA 
+# 9 2 µV/pA 
+# 10 5 µV/pA 
+# 11 10 µV/pA 
+# 12 20 µV/pA 
+# 13 50 µV/pA
+# 14 100 µV/pA
+# 15 200 µV/pA
+# 16 500 µV/pA
+# 17 1 mV/nA
+# 18 2 mV/nA
+# 19 5 mV/nA
+# 20 10 mV/nA
+# 21 20 mV/nA
+# 22 50 mV/nA
+# 23 100 mV/nA
+# 24 200 mV/nA
+# 25 500 mV/nA
+# 26 1 V/µA

@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# FMR-Acquisition
+# ---------------------------------------------------------------------------
+# Measurement data never goes in the repo -- it lives in the data folder
+# (see fmrui/paths.py). These catch anything written inside the checkout.
+data/
+local_config.yaml
+magnet_calibration.json
+calibration_*.csv
+calibration_*.png
+*_run_metadata.json
+
+# Legacy scripts write their output next to themselves; keep only the code.
+legacy/*
+!legacy/*.py
+!legacy/*.yaml
+!legacy/*.md
+!legacy/calibrate_power_supply

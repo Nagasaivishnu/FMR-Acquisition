@@ -1,0 +1,101 @@
+from pymeasure.instruments.kepco import KepcoBOP3612
+from pymeasure.instruments.lakeshore import LakeShore425
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import curve_fit
+import numpy as np
+
+
+def set_field(value):
+    gaussmter = LakeShore425('COM5')
+    powersupply = KepcoBOP3612('GPIB0::6::INSTR')
+    powersupply.operating_mode = 'CURR'
+    powersupply.output_enabled = True
+    powersupply.voltage_setpoint = 14
+    
+    print(value)
+    curr = (value +0.0005669588176526382)/0.024150454853605643
+    # curr = (value - 0.0012445741735022864)/0.024277877075667934
+    print(curr)
+    powersupply.current_setpoint = curr 
+    time.sleep(5)
+    print(powersupply.current)
+    print(gaussmter.field)
+    print("Remove sample")
+    time.sleep(300)
+
+def calibrate_magnetic_field():
+    gaussmter = LakeShore425('COM4')
+    powersupply = KepcoBOP3612('GPIB0::6::INSTR')
+    powersupply.operating_mode = 'CURR'
+    powersupply.output_enabled = True
+    powersupply.voltage_setpoint = 14
+    powersupply.current_setpoint = 7
+    time.sleep(10)
+    print(powersupply.current)
+    print(gaussmter.field)
+
+    curr = 7
+    currs = []
+    meas_currs = []
+    field = []
+    while curr < 10:
+        field.append(gaussmter.field)
+        currs.append(round(curr, 3))
+        meas_currs.append(powersupply.current)
+        curr = curr + 0.002
+        powersupply.current_setpoint = curr
+        powersupply.wait_to_continue()
+        print(round(curr, 3), gaussmter.field)
+        time.sleep(1)
+    
+    powersupply.output_enabled = False
+    with open("calibrated_data_14072025_high_field_A97.csv", "w") as file:
+        file.write("field,AppliedCurrent,MeasureCurrent")
+        for i in range(len(currs)):
+            file.write(f"{field[i]}, {currs[i]}, {meas_currs[i]}\n")
+     
+    plt.plot(currs, field)
+    plt.savefig("Applied_curr_vs_field_14072025_high_field_A97.png")
+    plt.close()
+
+def post_process(file_name):
+    df = pd.read_csv(file_name)  # Replace with your file name
+
+    # Preview the first few rows
+    print(df.columns)
+
+    # Plot (example: x = first column, y = second column)
+    plt.plot(df['field'], df['AppliedCurrent'])  # or specify column names like df['Date'], df['Sales']
+    plt.xlabel('field')
+    plt.ylabel('AppliedCurrent')
+    plt.grid(True)
+
+
+    
+    def line_equation(curr, m, c):
+        return ((curr*m) + c)
+    
+    popt, pcov = curve_fit(line_equation, df['AppliedCurrent'], df['field'],  p0=[0.02, -0.00149])
+
+    m, c = popt
+    
+    print(m , c)
+
+    curr_fit = np.linspace(min(df['AppliedCurrent']), max(df['AppliedCurrent']), 100)
+    field_fit = line_equation(curr_fit, m, c)
+
+    plt.scatter(field_fit, curr_fit, label="Given Data", color="red", s=10)
+    plt.plot(df['field'], df['AppliedCurrent'])  # or specify column names like df['Date'], df['Sales']
+    plt.xlabel('field')
+    plt.ylabel('AppliedCurrent')
+    plt.grid(True)
+    plt.show()
+    
+
+if __name__ == "__main__":
+    
+    # calibrate_magnetic_field()
+    #set_field(0.12093)
+    post_process('calibrated_data_14072025_low_field_A97.csv')

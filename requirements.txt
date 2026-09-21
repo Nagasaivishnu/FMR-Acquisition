@@ -1,0 +1,18 @@
+# pip install -r requirements.txt
+#
+# Tkinter is not listed -- it ships with the standard python.org Windows
+# installer. If `import tkinter` fails, re-run the installer and tick
+# "tcl/tk and IDLE".
+
+numpy>=1.24
+matplotlib>=3.7
+PyYAML>=6.0
+
+# Hardware only. The UI runs without these in Simulate mode.
+pymeasure>=0.13
+pyvisa>=1.13
+
+# Optional: only needed if you want to run the existing analysis scripts
+# in the parent folder on the files this app writes.
+# pandas>=2.0
+# scipy>=1.10
